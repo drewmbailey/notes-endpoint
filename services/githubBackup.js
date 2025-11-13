@@ -8,6 +8,7 @@ import {
   getAllCategoryFolders,
   getNotesInFolder,
   downloadFileContent,
+  getDriveTree,
 } from "./googleDrive.js";
 
 // ==== GitHub Backup Service ====
@@ -80,7 +81,7 @@ function generateCategoryIndex(folderPath, categoryName, entries, newestTimestam
 /**
  * Generate root index file
  * @param {string} tmpDir - Temporary directory path
- * @param {Array} categories - Array of category objects
+ * @param {Array} categories - Array of category objects with name, lastUpdated, path
  * @param {string} backupTimestamp - Backup timestamp string
  */
 function generateRootIndex(tmpDir, categories, backupTimestamp) {
@@ -88,8 +89,9 @@ function generateRootIndex(tmpDir, categories, backupTimestamp) {
   const rootLines = ["# Notes Index", ""];
   
   for (const cat of categories.sort((a, b) => a.name.localeCompare(b.name))) {
+    const indexPath = cat.path ? `./${cat.path}/index.md` : './index.md';
     rootLines.push(
-      `- [${cat.name}](./${cat.name}/index.md) — last updated ${cat.lastUpdated}`
+      `- [${cat.name}](${indexPath}) — last updated ${cat.lastUpdated}`
     );
   }
   
@@ -209,7 +211,7 @@ async function commitAndPush(git) {
 }
 
 /**
- * Backup all notes from Google Drive to GitHub
+ * Backup all notes from Google Drive to GitHub using recursive tree traversal
  */
 export async function backupNotesToGitHub() {
   const tmpDir = path.join(os.tmpdir(), "notes-backup");
@@ -232,23 +234,98 @@ export async function backupNotesToGitHub() {
       timeStyle: "short",
     });
 
-    // Fetch all category folders
-    const folders = await getAllCategoryFolders();
-    const categories = [];
-
-    // Process each category
-    for (const folder of folders) {
-      const { entries, newest } = await processCategory(folder, tmpDir);
-      
-      // Generate category index
-      const lastUpdated = newest ? new Date(newest).toISOString().split("T")[0] : "—";
-      generateCategoryIndex(tmpDir + "/" + folder.name, folder.name, entries, newest, backupTimestamp);
-      
-      categories.push({ name: folder.name, lastUpdated });
+    // Get entire Drive tree recursively
+    console.log("Fetching Drive tree recursively...");
+    const tree = await getDriveTree();
+    
+    // Organize notes by folder path
+    const folderMap = new Map(); // path -> { notes: [], lastModified: timestamp }
+    
+    for (const item of tree) {
+      if (item.type === "note") {
+        const folderPath = item.path || ""; // Root-level notes have empty path
+        
+        if (!folderMap.has(folderPath)) {
+          folderMap.set(folderPath, { notes: [], lastModified: 0 });
+        }
+        
+        const folderData = folderMap.get(folderPath);
+        folderData.notes.push(item);
+        
+        const modifiedTime = new Date(item.modifiedTime).getTime();
+        if (modifiedTime > folderData.lastModified) {
+          folderData.lastModified = modifiedTime;
+        }
+      }
     }
-
-    // Generate root index
-    generateRootIndex(tmpDir, categories, backupTimestamp);
+    
+    // Process each folder and its notes
+    const categories = [];
+    
+    for (const [folderPath, folderData] of folderMap.entries()) {
+      console.log(`Processing folder: ${folderPath || "(root)"}`);
+      
+      // Create folder structure on disk
+      const diskPath = folderPath ? path.join(tmpDir, folderPath) : tmpDir;
+      if (!fs.existsSync(diskPath)) {
+        fs.mkdirSync(diskPath, { recursive: true });
+      }
+      
+      const entries = [];
+      
+      // Process each note in this folder
+      for (const note of folderData.notes) {
+        try {
+          // Download file content
+          const content = await downloadFileContent(note.id);
+          
+          const createdISO = new Date(note.createdTime).toISOString();
+          const updatedISO = new Date(note.modifiedTime).toISOString();
+          
+          // Add or update YAML front-matter
+          const contentWithFrontMatter = addOrUpdateFrontMatter(content, createdISO, updatedISO);
+          
+          fs.writeFileSync(path.join(diskPath, note.name), contentWithFrontMatter + "\n", "utf8");
+          
+          const modified = new Date(note.modifiedTime);
+          entries.push({
+            name: note.name,
+            date: modified.toISOString().split("T")[0],
+          });
+        } catch (fileErr) {
+          console.error(`Error processing file ${note.name}:`, fileErr.message);
+          // Continue with other files
+        }
+      }
+      
+      // Generate index for this folder
+      if (entries.length > 0) {
+        const folderName = folderPath ? folderPath.split("/").pop() : "Notes";
+        const lastUpdated = folderData.lastModified 
+          ? new Date(folderData.lastModified).toISOString().split("T")[0] 
+          : "—";
+        
+        generateCategoryIndex(diskPath, folderName, entries, folderData.lastModified, backupTimestamp);
+        
+        // Track category for root index
+        categories.push({ 
+          name: folderPath || "(root)", 
+          lastUpdated,
+          displayName: folderPath || "Root Notes"
+        });
+      }
+    }
+    
+    // Generate root index with all top-level categories
+    const topLevelCategories = categories
+      .filter(cat => !cat.name.includes("/") || cat.name === "(root)")
+      .map(cat => ({
+        name: cat.displayName,
+        lastUpdated: cat.lastUpdated,
+        path: cat.name === "(root)" ? "" : cat.name
+      }));
+    
+    generateRootIndex(tmpDir, topLevelCategories, backupTimestamp);
 
     // Commit and push changes
     await commitAndPush(git);
