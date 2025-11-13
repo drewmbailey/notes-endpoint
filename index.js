@@ -8,6 +8,10 @@ import notesRoutes from "./routes/notes.js";
 
 // ==== Express App Setup ====
 const app = express();
+
+// Trust Railway's proxy for rate limiting and IP detection
+app.set('trust proxy', true);
+
 app.use(bodyParser.json({ limit: "2mb" }));
 
 // ==== Routes ====
